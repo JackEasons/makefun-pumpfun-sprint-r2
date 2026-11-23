@@ -8,7 +8,7 @@ Tide — a pump.fun replay trading bot for make.fun's "Winner Takes All — $5 P
 
 ## Strategy
 
-Almost every fresh pump.fun coin bleeds, and only ~6% of launches ever double from their opening price — so Tide is a fast launch sniper, in and out within ~15 slots. It buys in two tiers: a strict tier (0.15 SOL per coin on launches whose opening tape looks clean: exactly 3 distinct non-creator buyers, creator buy at most 0.5 SOL, real SOL reserve at least 1 SOL, no creator sell) and a guardrail tier (0.01 SOL, the minimum round-trip size, on looser launches so the run clears the 20-coin guardrail on a 6-hour window). Exits: a 12% stop loss, exit when the creator sells, or after 15 slots — whichever comes first. A coin is never bought again once exited.
+Almost every fresh pump.fun coin bleeds, and only ~6% of launches ever double from their opening price — so Tide is a fast launch sniper, in and out within ~15 slots. It buys in two tiers: a strict tier (0.3 SOL per coin on launches whose opening tape looks clean: exactly 3 distinct non-creator buyers, creator buy at most 0.5 SOL, real SOL reserve at least 1 SOL, no creator sell) and a guardrail tier (0.01 SOL, the minimum round-trip size, on looser launches so the run clears the 20-coin guardrail on a 6-hour window). Exits: a 12% stop loss, exit when the creator sells, or after 15 slots — whichever comes first. A coin is never bought again once exited.
 
 The final 6-hour window is recorded after entries close, so there is no dev data for it — the strategy is deliberately generic and robust rather than fitted to any sample: it was tuned on the kit's 24-hour dev window (all three dataset parts) with a local replay simulator, checking the result across each third of the window, not just the total.
 
