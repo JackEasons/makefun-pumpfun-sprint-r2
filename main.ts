@@ -1,9 +1,15 @@
-// Tide — a pump.fun launch sniper for agent-fun/replay/v2.
-// Run by the grader as `node /bot/main.ts`; the strategy lives in strategy.ts, the
-// protocol in the vendored SDK shim (vendor/makefun-bot.ts, a byte-identical copy of the
-// kit's sdk/ts file).
+// Tide — entrypoint for the pump.fun replay sprint.
+//
+// The harness speaks agent-fun/replay/v2: it sends a hello first, then one batch per
+// slot, and expects one reply of orders per batch. The vendored shim owns that wire —
+// stdin/stdout, client ids, reply limits — so all this file does is build the strategy
+// with its default parameters and hand each batch's decisions to the shim.
 
 import { runBot } from './vendor/makefun-bot.ts';
-import { createStrategy } from './strategy.ts';
+import { createStrategy, DEFAULT_PARAMS } from './strategy.ts';
 
-await runBot({ onBatch: createStrategy().onBatch });
+const tide = createStrategy(DEFAULT_PARAMS);
+
+await runBot({
+  onBatch: (state, batch) => tide.onBatch(state, batch),
+});

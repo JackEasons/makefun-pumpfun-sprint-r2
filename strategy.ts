@@ -1,371 +1,340 @@
-// Tide — a fast launch sniper for agent-fun/replay/v2 (pump.fun bonding curves).
+// Tide — a two-tier fast launch sniper for the pump.fun replay sprint.
 //
-// What the dev window teaches: almost every fresh pump.fun coin bleeds. The median coin is
-// down ~17% within 100 slots of a hot opening, and only ~6% of launches ever double from their
-// opening price. Every pilot in the kit loses on the full 24-hour dev window, and the one that
-// loses least is the fastest — in and out within a dozen slots, small stakes, tight stop.
-// So Tide does that, in two tiers:
+// The dev window is a slow bleed: the median launch falls roughly 17% within a hundred
+// slots of a hot opening, and only about 6% of launches ever double. So this bot never
+// sits on a runner hoping it comes back. It buys a launch only while its opening tape is
+// still young, and it is out again within fifteen slots — on a stop, a take-profit, a
+// creator sale, or time, whichever comes first.
 //
-//   Tier A (the money tier): strict opening tape — exactly 3 distinct non-creator buyers (a
-//   launch bundled by many wallets is a dump in waiting), creator buy at most 0.5 SOL, real
-//   SOL reserve at least 1 SOL (so the 1%-of-reserve per-reply buy cap still allows a
-//   0.01 SOL buy: the round-trip size the guardrails ask for), no creator sell, no large
-//   single sell, sells a small share of buys, recent net flow not negative. Stake 0.3 SOL —
-//   the 1%-of-reserve per-reply cap binds first on most coins, so a larger stake only
-//   sizes up the high-reserve launches; the sim plateaus at 0.3 SOL and is flat to 0.5.
-//   Tier B (the guardrail tier): the same launch window with looser tape (1-5 buyers,
-//   creator buy up to 2 SOL) at the minimum 0.01 SOL stake. It exists so the run clears the
-//   guardrail — a round trip of at least 0.01 SOL on at least 20 coins — on a 6-hour final
-//   window, where the strict tier alone would only reach ~12 coins, at a bleed of roughly
-//   one tx fee plus curve fees per trip. It also keeps a small lottery ticket on every
-//   launch in case one of the loose coins is the window's runner.
+// Two ways in, both sized by the tape rather than by hope:
+//   Strict — a clean, busy opening: three to five separate buyers who are not the
+//     creator, the creator's own buy small, real liquidity between 1 and 3 SOL behind
+//     the curve, no creator sale, no outsized single sale, sales under half of buys,
+//     flow not negative. The 3 SOL ceiling matters: past it the launch is already hot
+//     and the 1%-of-reserve cap would size the buy far past the intended stake, so
+//     those launches fall through to the guardrail tier instead. Sized at 0.3 SOL;
+//     the harness's 1% cap trims that on most curves that qualify.
+//   Guardrail — a looser opening (one to five buyers, creator buy under 2 SOL) at the
+//     0.01 SOL minimum, so the run still clears the twenty-coin guardrail on a short
+//     final window, where the strict tier alone would only reach about a dozen coins.
+// A coin is bought at most once per run, whatever happens to it afterwards.
+// Exits bank a hot opening's spike (+10%) rather than waiting out the fifteen slots
+// for the bleed that usually follows.
 //
-// Exits (both tiers, whole position): stop loss 12% under cost, exit when the creator sells
-// while held, or after 15 slots (a touch more room than 10 lets a quick runner show itself
-// before the exit) — whichever comes first. No partial take-profit and no trailing stop by
-// default: at a 15-slot hold they never trigger, and the data says holding longer only lets
-// positions bleed. A coin is never bought again once exited or filtered out.
-//
-// The final 6-hour window is recorded after entries close, so there is no dev data for it.
-// Nothing here is fitted to a single coin: the knobs were chosen on the kit's 24-hour dev
-// window (all three dataset parts) by total net PnL with each third of the window reported
-// separately, and the fast-exit shape is what survives across all three thirds.
-//
-// Pure function of the batches it is fed: no clock, no randomness, no I/O, iteration only
-// over insertion-ordered maps, so two runs of the same replay produce the same orders.
+// Deterministic by construction: no clock, no randomness, no environment reads. The only
+// inputs are the batches the harness delivers.
 
-import { BPS, type BotState, type Batch, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
+import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
 
-export interface Tier {
-  /** Lamports staked per coin in this tier. */
-  stake: number;
-  /** Distinct non-creator buyers seen before entry: window. */
-  minBuyers: number;
-  maxBuyers: number;
-  /** Creator's own buys in the create slot, at most (lamports). */
-  maxDevBuy: number;
-}
-
+/** Every knob the strategy turns, in lamports and slots unless the name says otherwise. */
 export interface Params {
-  /** Youngest age (slots since create) at which a coin may be bought. */
-  minAge: number;
-  /** Oldest age (slots since create) at which a first buy may still be decided. */
-  maxAge: number;
-  /** Smallest single buy worth paying the tx fee for; also the guardrail's round-trip size. */
-  minBuyLamports: number;
-  /** Real SOL reserve window at decision time (lamports). */
+  /** SOL spent on a strict-tier buy. */
+  strictStake: number;
+  /** SOL spent on a guardrail-tier buy (the minimum round-trip size). */
+  guardStake: number;
+  /** Distinct non-creator buyers a strict opening needs. */
+  strictMinBuyers: number;
+  /** Most distinct non-creator buyers a strict opening tolerates. A launch
+   * whose opening is already crowded has usually already had its move. */
+  strictMaxBuyers: number;
+  /** Largest total creator buy a strict opening tolerates. */
+  strictMaxCreatorBuy: number;
+  /** Least real SOL a curve must hold before either tier buys it. */
   minRealSol: number;
-  maxRealSol: number;
-  /** Lamports sold by others / lamports bought, as bps, at most. */
-  maxSellRatioBps: number;
-  /** Largest single non-creator sell seen, as bps of the real SOL reserve before it, at most. */
-  maxBigSellBps: number;
-  /** Price now over the create price, as bps: window (wide by default — the price jumps ~30%
-      at the first trade, so a tight run-up cap blocks every launch). */
-  minRunupBps: number;
-  maxRunupBps: number;
-  /** The recent-flow window (slots) and what it must show. */
-  flowWindow: number;
-  minFlowLamports: number;
-  /** Creator sold before entry: skip the coin. */
-  skipDevSold: boolean;
-  /** Slippage allowed on buys (bps). Sells always go out at 10000. */
-  buySlippageBps: number;
-  /** The two entry tiers, strict first. */
-  tiers: [Tier, Tier];
-  /** First take-profit: sell tp1PartBps of the position once it is worth tp1Bps over its cost.
-      Default off (tp1Bps above any reachable move): at a 15-slot hold it never pays. */
-  tp1Bps: number;
-  tp1PartBps: number;
-  /** Exit when the position is worth this much under its cost (bps). */
-  slBps: number;
-  /** Trailing stop: once up at least trailArmBps, exit on a fall of trailBps from the best
-      value. Default off (trailArmBps above any reachable move). */
-  trailArmBps: number;
-  trailBps: number;
-  /** Exit after holding this many slots. */
-  maxHold: number;
-  /** Exit when the creator sells while held. */
-  exitOnDevSell: boolean;
+  /** Most real SOL a strict opening tolerates. Past it the launch is already
+   * hot and the 1% cap would size the buy far past the intended stake. */
+  strictMaxRealSol: number;
+  /** Sales as a share of buys (bps) a strict opening tolerates. */
+  strictMaxSellShareBps: number;
+  /** A single sale bigger than this spoils a strict opening. */
+  maxSingleSell: number;
+  /** Fewest distinct non-creator buyers a guardrail opening needs. */
+  guardMinBuyers: number;
+  /** Most distinct non-creator buyers a guardrail opening tolerates. */
+  guardMaxBuyers: number;
+  /** Largest total creator buy a guardrail opening tolerates. */
+  guardMaxCreatorBuy: number;
+  /** A launch older than this (slots since its creation) is never bought. */
+  maxAgeSlots: number;
+  /** A position is sold once it has been held this many slots. */
+  maxHoldSlots: number;
+  /** A position is sold once its mark value falls this far below its cost (bps). */
+  stopLossBps: number;
+  /** A position is sold once its mark value rises this far above its cost (bps).
+   * 0 disables it. Hot launches spike and then bleed, so banking the spike beats
+   * waiting out the fifteen slots. */
+  takeProfitBps: number;
+  /** Slippage allowance on every order. */
+  slippageBps: number;
+  /** Slippage allowance on sell orders. Exits must execute even while the price is
+   * falling away from the decision-time quote, so sells get a wide allowance; a
+   * tight allowance would leave a stopped position bleeding through repeated
+   * rejections. Buys keep the tight allowance above. */
+  sellSlippageBps: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  minAge: 0,
-  maxAge: 6,
-  minBuyLamports: 10_000_000,
+  strictStake: 300_000_000,
+  guardStake: 10_000_000,
+  strictMinBuyers: 3,
+  strictMaxBuyers: 5,
+  strictMaxCreatorBuy: 500_000_000,
   minRealSol: 1_000_000_000,
-  maxRealSol: 40_000_000_000,
-  maxSellRatioBps: 5_000,
-  maxBigSellBps: 2_000,
-  minRunupBps: 0,
-  maxRunupBps: 100_000,
-  flowWindow: 10,
-  minFlowLamports: 0,
-  skipDevSold: true,
-  buySlippageBps: 10_000,
-  tiers: [
-    { stake: 300_000_000, minBuyers: 3, maxBuyers: 3, maxDevBuy: 500_000_000 },
-    { stake: 10_000_000, minBuyers: 1, maxBuyers: 5, maxDevBuy: 2_000_000_000 },
-  ],
-  tp1Bps: 1_000_000,
-  tp1PartBps: 5_000,
-  slBps: 1_200,
-  trailArmBps: 1_000_000,
-  trailBps: 1_500,
-  maxHold: 15,
-  exitOnDevSell: true,
+  strictMaxRealSol: 3_000_000_000,
+  strictMaxSellShareBps: 5000,
+  maxSingleSell: 500_000_000,
+  guardMinBuyers: 1,
+  guardMaxBuyers: 5,
+  guardMaxCreatorBuy: 2_000_000_000,
+  maxAgeSlots: 10,
+  maxHoldSlots: 15,
+  stopLossBps: 1200,
+  takeProfitBps: 1000,
+  slippageBps: 500,
+  sellSlippageBps: 10000,
 };
 
-interface Tick {
-  slot: number;
-  isBuy: boolean;
-  sol: bigint;
-  user: Pubkey;
-}
-
-interface Coin {
-  mint: Pubkey;
-  createSlot: number;
-  creator: Pubkey;
-  /** Create-time reserves: the price run-up is measured against them. */
-  vq0: bigint;
-  vt0: bigint;
-  devBuy: bigint;
-  trades: number;
-  buyers: Set<Pubkey>;
-  bought: bigint;
-  soldByOthers: bigint;
-  bigSellBps: bigint;
-  devSold: boolean;
-  lastTradeSlot: number;
-  /** Trades of the last flowWindow slots (older ones dropped as new ones come). */
-  recent: Tick[];
-  /** Never buy it again (exited, filtered out for good, or completed). */
-  done: boolean;
+/** Everything the opening tape of one mint has shown so far. */
+interface Tape {
+  /** The wallet that created the curve. */
+  creator: string;
+  /** Slot of the CreateEvent, or -1 when the mint was first seen through a trade. */
+  born: number;
+  /** Distinct wallets (other than the creator) that have bought. */
+  buyers: Set<string>;
+  /** SOL the creator has spent buying, in lamports. */
+  creatorBuy: bigint;
+  /** SOL all buys have spent, in lamports. */
+  buyVol: bigint;
+  /** SOL all sells have taken out, in lamports. */
+  sellVol: bigint;
+  /** Whether the creator has sold anything. */
+  creatorSold: boolean;
+  /** Largest single sale, in lamports. */
+  biggestSell: bigint;
+  /** Whether the curve has completed. */
   complete: boolean;
 }
 
-interface Held {
-  openedSlot: number;
-  txPaid: bigint;
-  best: bigint;
-  devSoldAtOpen: boolean;
-  tookTp1: boolean;
+/** A position this strategy opened, keyed by what its buy fill reported. */
+interface Opened {
+  /** Slot of the batch the buy was decided on. */
+  decidedSlot: number;
 }
 
-export interface Strategy {
+const BPS = 10_000n;
+
+function freshTape(creator: string, born: number): Tape {
+  return {
+    creator,
+    born,
+    buyers: new Set<string>(),
+    creatorBuy: 0n,
+    buyVol: 0n,
+    sellVol: 0n,
+    creatorSold: false,
+    biggestSell: 0n,
+    complete: false,
+  };
+}
+
+/** Fold one trade into its mint's tape. Amounts arrive as u64 decimal strings. */
+function noteTrade(tape: Tape, ev: {
+  is_buy: boolean;
+  user: string;
+  sol_amount: string;
+}): void {
+  const sol = BigInt(ev.sol_amount);
+  if (ev.is_buy) {
+    tape.buyVol += sol;
+    if (ev.user === tape.creator) {
+      tape.creatorBuy += sol;
+    } else {
+      tape.buyers.add(ev.user);
+    }
+  } else {
+    tape.sellVol += sol;
+    if (ev.user === tape.creator) tape.creatorSold = true;
+    if (sol > tape.biggestSell) tape.biggestSell = sol;
+  }
+}
+
+/** The strict tier: a busy, clean opening with real liquidity behind it. */
+function passesStrict(tape: Tape, realSol: bigint, p: Params): boolean {
+  if (tape.complete) return false;
+  if (tape.buyers.size < p.strictMinBuyers) return false;
+  if (tape.buyers.size > p.strictMaxBuyers) return false;
+  if (tape.creatorBuy > BigInt(p.strictMaxCreatorBuy)) return false;
+  if (realSol < BigInt(p.minRealSol)) return false;
+  if (realSol > BigInt(p.strictMaxRealSol)) return false;
+  if (tape.creatorSold) return false;
+  if (tape.biggestSell > BigInt(p.maxSingleSell)) return false;
+  if (tape.sellVol * BPS > tape.buyVol * BigInt(p.strictMaxSellShareBps)) return false;
+  if (tape.sellVol > tape.buyVol) return false;
+  return true;
+}
+
+/** The guardrail tier: a looser opening, bought at the minimum size. */
+function passesGuardrail(tape: Tape, realSol: bigint, p: Params): boolean {
+  if (tape.complete) return false;
+  if (tape.buyers.size < p.guardMinBuyers) return false;
+  if (tape.buyers.size > p.guardMaxBuyers) return false;
+  if (tape.creatorBuy > BigInt(p.guardMaxCreatorBuy)) return false;
+  if (realSol < BigInt(p.minRealSol)) return false;
+  return true;
+}
+
+/** Mark value of a token balance at the curve's latest virtual reserves. */
+function markValue(tokens: bigint, virtualTokens: bigint, virtualQuote: bigint): bigint {
+  if (virtualTokens === 0n) return 0n;
+  return (tokens * virtualQuote) / virtualTokens;
+}
+
+/** The strategy itself: per-mint tapes, open positions, and coins never to touch again. */
+export function createStrategy(params: Params): {
   onBatch(state: BotState, batch: Batch): OrderInput[];
-}
+} {
+  const p: Params = { ...params };
+  /** Opening tapes by mint, in first-seen order. */
+  const tapes = new Map<string, Tape>();
+  /** Positions this strategy holds, by mint. */
+  const open = new Map<string, Opened>();
+  /** Coins already bought once this run — never bought again. */
+  const done = new Set<string>();
+  /** Counter for client ids; the shim would assign its own, but explicit ids let the
+   * strategy match fills back to the orders that caused them. */
+  let nextId = 1;
 
-/** Curve fees charged on every trade: protocol 95 bps + creator 30 bps. */
-const FEE_BPS = 125n;
-
-/** What selling `tokens` against (vq, vt) would pay after curve fees. */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  const q = (tokens * vq) / (vt + tokens);
-  return q - (q * FEE_BPS + BPS - 1n) / BPS;
-}
-
-export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
-  const P = params;
-  const coins = new Map<Pubkey, Coin>();
-  const held = new Map<Pubkey, Held>();
-  /** Mints with a sell in flight. */
-  const selling = new Set<Pubkey>();
-  const minBuy = BigInt(P.minBuyLamports);
-
-  function readEvents(batch: Batch): void {
-    for (const e of batch.events) {
-      if (e.event === 'CreateEvent') {
-        coins.set(e.mint, {
-          mint: e.mint,
-          createSlot: e.slot,
-          creator: e.creator,
-          vq0: BigInt(e.virtual_quote_reserves),
-          vt0: BigInt(e.virtual_token_reserves),
-          devBuy: 0n,
-          trades: 0,
-          buyers: new Set(),
-          bought: 0n,
-          soldByOthers: 0n,
-          bigSellBps: 0n,
-          devSold: false,
-          lastTradeSlot: e.slot,
-          recent: [],
-          done: false,
-          complete: false,
-        });
-      } else if (e.event === 'TradeEvent') {
-        const c = coins.get(e.mint);
-        if (c === undefined) continue;
-        const sol = BigInt(e.sol_amount);
-        c.trades += 1;
-        c.lastTradeSlot = e.slot;
-        c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
-        const isDev = e.user === c.creator;
-        if (e.is_buy) {
-          c.bought += sol;
-          if (isDev && e.slot === c.createSlot) c.devBuy += sol;
-          else if (!isDev) c.buyers.add(e.user);
-        } else if (isDev) {
-          c.devSold = true;
-        } else {
-          c.soldByOthers += sol;
-          const rqBefore = BigInt(e.real_quote_reserves) + sol;
-          if (rqBefore > 0n) {
-            const bps = (sol * BPS) / rqBefore;
-            if (bps > c.bigSellBps) c.bigSellBps = bps;
-          }
-        }
-      } else {
-        const c = coins.get(e.mint);
-        if (c !== undefined) {
-          c.complete = true;
-          c.done = true;
-        }
+  /** Settle the fills that resolved since the last batch. */
+  function settleFills(batch: Batch): void {
+    for (const fill of batch.fills) {
+      if (fill.side === 'buy' && fill.status === 'filled') {
+        open.set(fill.mint, { decidedSlot: fill.decided_slot });
+      } else if (fill.side === 'sell' && fill.status === 'filled') {
+        open.delete(fill.mint);
       }
     }
   }
 
-  /** Net lamports bought minus sold over the last flowWindow slots. */
-  function flow(c: Coin, slot: number): bigint {
-    const from = slot - P.flowWindow;
-    let drop = 0;
-    while (drop < c.recent.length && c.recent[drop]!.slot <= from) drop++;
-    if (drop > 0) c.recent.splice(0, drop);
-    let net = 0n;
-    for (const t of c.recent) net += t.isBuy ? t.sol : -t.sol;
-    return net;
+  /** Take this batch's events into the tapes. */
+  function ingest(batch: Batch): void {
+    for (const ev of batch.events) {
+      if (ev.event === 'CreateEvent') {
+        if (!tapes.has(ev.mint)) tapes.set(ev.mint, freshTape(ev.creator, ev.slot));
+      } else if (ev.event === 'TradeEvent') {
+        let tape = tapes.get(ev.mint);
+        if (tape === undefined) {
+          tape = freshTape(ev.creator, -1);
+          tapes.set(ev.mint, tape);
+        }
+        noteTrade(tape, ev);
+      } else if (ev.event === 'CompleteEvent') {
+        const tape = tapes.get(ev.mint);
+        if (tape !== undefined) tape.complete = true;
+      }
+    }
   }
 
-  function hasPendingSell(state: BotState, mint: Pubkey): boolean {
-    for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'sell') return true;
+  /** Drop open records the account no longer holds (harness closes settle as fills). */
+  function reconcile(state: BotState): void {
+    for (const mint of [...open.keys()]) {
+      if (!state.positions.has(mint)) open.delete(mint);
+    }
+  }
+
+  /** True when an order of this side on this mint is still waiting for its fill. */
+  function hasPending(state: BotState, mint: string, side: 'buy' | 'sell'): boolean {
+    for (const pending of state.pending.values()) {
+      if (pending.order.mint === mint && pending.order.side === side) return true;
+    }
     return false;
   }
 
-  /** The opening tape, shared by both tiers; the tier only sets stake, buyer window and dev-buy cap. */
-  function tapePasses(c: Coin, tier: Tier, slot: number): boolean {
-    const curve = coinsCurve(c);
-    if (curve === undefined || curve.complete) return false;
-    const rq = curve.real_quote_reserves;
-    if (rq < BigInt(P.minRealSol) || rq > BigInt(P.maxRealSol)) return false;
-    if (c.devBuy > BigInt(tier.maxDevBuy)) return false;
-    if (c.buyers.size < tier.minBuyers || c.buyers.size > tier.maxBuyers) return false;
-    if (c.bought > 0n && c.soldByOthers * BPS > c.bought * BigInt(P.maxSellRatioBps)) return false;
-    if (c.bigSellBps > BigInt(P.maxBigSellBps)) return false;
-    const runup = (curve.virtual_quote_reserves * c.vt0 * BPS) / (curve.virtual_token_reserves * c.vq0);
-    if (runup > BigInt(P.maxRunupBps) || runup < BigInt(P.minRunupBps)) return false;
-    if (flow(c, slot) < BigInt(P.minFlowLamports)) return false;
-    return true;
+  /** One batch of decisions: exits first, then entries, in tape order. */
+  function onBatch(state: BotState, batch: Batch): OrderInput[] {
+    settleFills(batch);
+    ingest(batch);
+    reconcile(state);
+
+    const orders: OrderInput[] = [];
+    const txFee = state.txFeeLamports();
+
+    // --- Exits: time, creator sale, or stop — whichever comes first. ---
+    for (const [mint, entry] of open) {
+      if (hasPending(state, mint, 'sell')) continue;
+      const held = state.positions.get(mint);
+      if (held === undefined) continue;
+      const tape = tapes.get(mint);
+      // The hold clock runs from the launch itself, not from the buy: the design is
+      // in and out within fifteen slots of the launch, so a late entry gets a short
+      // stay. A tape whose birth is unknown falls back to the buy's decision slot.
+      const heldSince = tape !== undefined && tape.born >= 0 ? tape.born : entry.decidedSlot;
+      const heldSlots = batch.slot - heldSince;
+
+      let leave = false;
+      if (heldSlots >= p.maxHoldSlots) leave = true;
+      if (!leave && tape !== undefined && tape.creatorSold) leave = true;
+      if (!leave) {
+        const curve = state.curves.get(mint);
+        if (curve !== undefined) {
+          const value = markValue(held.token_amount, curve.virtual_token_reserves, curve.virtual_quote_reserves);
+          if (value * BPS < held.cost_lamports * (BPS - BigInt(p.stopLossBps))) leave = true;
+          if (!leave && p.takeProfitBps > 0 && value * BPS >= held.cost_lamports * (BPS + BigInt(p.takeProfitBps))) leave = true;
+        }
+      }
+      if (!leave) continue;
+      orders.push({
+        side: 'sell',
+        client_id: `s${nextId++}`,
+        mint,
+        token_amount: held.token_amount.toString(),
+        max_slippage_bps: p.sellSlippageBps,
+      });
+    }
+
+    // --- Entries: strict tier first, guardrail tier second, tape order. ---
+    let seats = state.hello.caps.max_open_positions - state.committedPositionCount();
+    let spareCash = state.freeCashLamports();
+    for (const [mint, tape] of tapes) {
+      if (orders.length >= state.hello.caps.max_orders_per_batch) break;
+      if (seats <= 0) break;
+      if (done.has(mint) || open.has(mint)) continue;
+      if (hasPending(state, mint, 'buy')) continue;
+      if (tape.born < 0) continue;
+      if (batch.slot - tape.born > p.maxAgeSlots) continue;
+      const curve = state.curves.get(mint);
+      if (curve === undefined || curve.complete) continue;
+      const realSol = curve.real_quote_reserves;
+
+      let stake: number | null = null;
+      if (passesStrict(tape, realSol, p)) {
+        stake = p.strictStake;
+      } else if (passesGuardrail(tape, realSol, p)) {
+        stake = p.guardStake;
+      }
+      if (stake === null) continue;
+
+      // The harness caps each reply's buys on a mint at 1% of its real reserve.
+      const cap = state.maxBuyLamports(mint);
+      let spend = BigInt(stake);
+      if (spend > cap) spend = cap;
+      if (spend <= 0n) continue;
+      if (spend + txFee > spareCash) continue;
+
+      orders.push({
+        side: 'buy',
+        client_id: `b${nextId++}`,
+        mint,
+        quote_lamports: spend.toString(),
+        max_slippage_bps: p.slippageBps,
+      });
+      done.add(mint);
+      seats -= 1;
+      spareCash -= spend + txFee;
+    }
+
+    return orders;
   }
 
-  /** Latest reserves for a tracked coin, from the state the shim keeps. */
-  let currentState: BotState | null = null;
-  function coinsCurve(c: Coin) {
-    return currentState?.curves.get(c.mint);
-  }
-
-  return {
-    onBatch(state, batch) {
-      currentState = state;
-      readEvents(batch);
-      const orders: OrderInput[] = [];
-      const cap = state.hello.caps.max_orders_per_batch;
-      const tx = state.txFeeLamports();
-      const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
-      for (const m of batch.marks) marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
-
-      for (const f of batch.fills) {
-        if (f.client_id.startsWith('_')) {
-          held.delete(f.mint);
-          selling.delete(f.mint);
-          continue;
-        }
-        const h = held.get(f.mint);
-        if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
-        if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: coins.get(f.mint)?.devSold ?? false, tookTp1: false });
-        }
-      }
-      for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
-      for (const mint of [...held.keys()]) {
-        if (!state.positions.has(mint) && !selling.has(mint)) held.delete(mint);
-      }
-
-      // Exits first: a position that must go outranks any new entry.
-      for (const [mint, pos] of state.positions) {
-        if (orders.length >= cap) break;
-        if (selling.has(mint)) continue;
-        const c = coins.get(mint);
-        let h = held.get(mint);
-        if (h === undefined) {
-          h = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: c?.devSold ?? false, tookTp1: false };
-          held.set(mint, h);
-        }
-        let mk = marks.get(mint);
-        if (mk === undefined) {
-          const cv = state.curves.get(mint);
-          if (cv === undefined) continue;
-          mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
-        }
-        const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
-        const basis = pos.cost_lamports + h.txPaid;
-        if (value > h.best) h.best = value;
-        let exit = false;
-        if (basis > 0n) {
-          if (!h.tookTp1 && value * BPS >= basis * (BPS + BigInt(P.tp1Bps))) {
-            const part = (pos.token_amount * BigInt(P.tp1PartBps)) / BPS;
-            if (part > 0n && part < pos.token_amount) {
-              orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: 10_000 });
-              selling.add(mint);
-              h.tookTp1 = true;
-              h.best = 0n;
-              if (c !== undefined) c.done = true;
-              continue;
-            }
-          }
-          if (value * BPS <= basis * (BPS - BigInt(P.slBps))) exit = true;
-          if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
-        }
-        if (state.slot - h.openedSlot >= P.maxHold) exit = true;
-        if (c !== undefined && P.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
-        if (!exit) continue;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
-        selling.add(mint);
-        if (c !== undefined) c.done = true;
-      }
-
-      // Entries, strict tier first so it gets the open-position slots.
-      let free = state.freeCashLamports() - tx * BigInt(orders.length);
-      let open = state.committedPositionCount();
-      for (const tier of P.tiers) {
-        const stake = BigInt(tier.stake);
-        for (const c of coins.values()) {
-          if (orders.length >= cap) break;
-          if (c.done || c.complete) continue;
-          const age = state.slot - c.createSlot;
-          if (age < P.minAge || age > P.maxAge) {
-            if (age > P.maxAge) c.done = true;
-            continue;
-          }
-          if (open >= state.hello.caps.max_open_positions) continue;
-          if (c.devSold && P.skipDevSold) {
-            c.done = true;
-            continue;
-          }
-          if (!tapePasses(c, tier, state.slot)) continue;
-          const maxBuy = state.maxBuyLamports(c.mint);
-          const amount = stake < maxBuy ? stake : maxBuy;
-          if (amount < minBuy) continue;
-          if (free < amount + tx) continue;
-          orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: P.buySlippageBps });
-          free -= amount + tx;
-          c.done = true;
-          open += 1;
-        }
-      }
-      return orders;
-    },
-  };
+  return { onBatch };
 }
