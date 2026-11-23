@@ -10,7 +10,7 @@
 //   launch bundled by many wallets is a dump in waiting), creator buy at most 0.5 SOL, real
 //   SOL reserve at least 1 SOL (so the 1%-of-reserve per-reply buy cap still allows a
 //   0.01 SOL buy: the round-trip size the guardrails ask for), no creator sell, no large
-//   single sell, sells a small share of buys, recent net flow not negative. Stake 0.1 SOL.
+//   single sell, sells a small share of buys, recent net flow not negative. Stake 0.15 SOL.
 //   Tier B (the guardrail tier): the same launch window with looser tape (1-5 buyers,
 //   creator buy up to 2 SOL) at the minimum 0.01 SOL stake. It exists so the run clears the
 //   guardrail — a round trip of at least 0.01 SOL on at least 20 coins — on a 6-hour final
@@ -102,7 +102,7 @@ export const DEFAULT_PARAMS: Params = {
   skipDevSold: true,
   buySlippageBps: 10_000,
   tiers: [
-    { stake: 100_000_000, minBuyers: 3, maxBuyers: 3, maxDevBuy: 500_000_000 },
+    { stake: 150_000_000, minBuyers: 3, maxBuyers: 3, maxDevBuy: 500_000_000 },
     { stake: 10_000_000, minBuyers: 1, maxBuyers: 5, maxDevBuy: 2_000_000_000 },
   ],
   tp1Bps: 1_000_000,
